@@ -6,15 +6,21 @@ from parser import load_payhere
 DATA = Path(__file__).parent / "data"
 
 # ---------- Settings ----------
+# Irregular days (reserved / special occasions): excluded from the forecast
 EVENT_CATEGORIES = [
     "abc market 🧺", "janemarch mkt", "25.04.26 제인마치",
     "sunday heaven", "🦪3.10 sunday🌿",
     "pot 3주년", "🌷jenny 시음회", "viaplain🧡💛", "타르틴", "🌿green j", "⚽️니벨크랙🍷",
     "10/11(대관)", "daycare center", "wendys 5yrs",
+    "❄️12월 pot", "🔴 red abc",
 ]
-SEASONAL = ["❄️12월", "❄️12월 pot", "🎄", "🔴 red abc"]
-WINE_OVERRIDE = ["daily glass", "half bottle", "half", "tmb half", "chillable red", "acid frick", "carbonic maceration"]
-BOTTLE_PRICE = 80000   # unclassified rows at or above this price are treated as wine
+# Rows in these categories hold unlabeled products; classify them by name
+CLASSIFY_CATS = ["❄️12월", "❄️12월 pot", "🎄", "🔴 red abc"]
+WINE_OVERRIDE = ["daily glass", "half bottle", "half", "tmb half", "chillable red",
+                 "acid frick", "carbonic maceration"]
+FOOD_FIX = ["pappardelle", "cheese olives", "spicy pepperoni", "charcueterie", "snowman", "onion ring"]
+BOTTLE_PRICE = 80000
+THU_SUN = ["Thursday", "Friday", "Saturday", "Sunday"]
 
 # ---------- 1. Load all files ----------
 frames = []
@@ -44,150 +50,235 @@ def norm(name):
     return re.sub(r"\s+", " ", s).strip()
 
 all_data["key"] = all_data["product"].map(norm)
-
-is_seasonal = all_data["category"].isin(SEASONAL)
-all_data.loc[is_seasonal, "key"] = (
-    all_data.loc[is_seasonal, "key"].str.replace(r"^12\s+", "", regex=True)
+to_classify = all_data["category"].isin(CLASSIFY_CATS)
+all_data.loc[to_classify, "key"] = (
+    all_data.loc[to_classify, "key"].str.replace(r"^12\s+", "", regex=True)
 )
+ALIASES = {"chicken wig": "chicken wing"}
+all_data["key"] = all_data["key"].replace(ALIASES)
 
 # ---------- 4. Manual overrides ----------
 all_data.loc[all_data["key"].isin(WINE_OVERRIDE), "group"] = "wine"
-all_data.loc[all_data["key"] == "1인 결제완료", "group"] = "admin"
+all_data.loc[all_data["key"].isin(["1인 결제완료", "1인 추가결제필요"]), "group"] = "admin"
+all_data.loc[all_data["key"] == "someday", "group"] = "wine"
+all_data.loc[all_data["key"].isin(FOOD_FIX), "group"] = "food"
+all_data.loc[all_data["key"] == "water", "group"] = "drink"
 
 all_data["is_addon"] = all_data["product"].str.strip().str.startswith("+")
 all_data.loc[all_data["is_addon"], "group"] = "addon"
 
-# ---------- 5. Seasonal rows: look up each name in normal categories ----------
+# ---------- 5. Unlabeled rows: look up names seen in normal categories ----------
 known = all_data[all_data["group"].isin(["food", "wine"])
-                 & ~all_data["category"].isin(SEASONAL + EVENT_CATEGORIES)]
-n_groups = known.groupby("key")["group"].nunique()
-print("names found under both food and wine:", n_groups[n_groups > 1].index.tolist())
+                 & ~all_data["category"].isin(CLASSIFY_CATS + EVENT_CATEGORIES)]
 lookup = known.groupby("key")["group"].agg(lambda s: s.mode().iloc[0])
-
-to_label = is_seasonal & (all_data["group"] == "other")
+to_label = to_classify & (all_data["group"] == "other")
 all_data.loc[to_label, "group"] = all_data.loc[to_label, "key"].map(lookup).fillna("unclassified")
 
-# ---------- 6. Price rule for what is still unclassified ----------
+# ---------- 6. Price rule + propagation for what is still unclassified ----------
 is_bottle = (all_data["group"] == "unclassified") & (all_data["unit_price"] >= BOTTLE_PRICE)
 all_data.loc[is_bottle, "group"] = "wine"
 
-# Propagate: a name already labeled wine (e.g., via the bottle price) is wine at any price
 wine_keys = set(all_data.loc[all_data["group"] == "wine", "key"])
 food_keys = set(all_data.loc[all_data["group"] == "food", "key"])
 still = all_data["group"] == "unclassified"
 all_data.loc[still & all_data["key"].isin(wine_keys - food_keys), "group"] = "wine"
 
-# Small manual labels
-FOOD_FIX = ["pappardelle", "cheese olives", "spicy pepperoni", "charcueterie"]
-all_data.loc[still & all_data["key"].isin(FOOD_FIX), "group"] = "food"
-all_data.loc[all_data["key"] == "1인 추가결제필요", "group"] = "admin"
-all_data.loc[all_data["key"] == "water", "group"] = "other"
-
-# Zero-revenue leftovers (modifier/note lines)
 zero = (all_data["group"] == "unclassified") & (all_data["net_revenue"].abs() < 10)
 all_data.loc[zero, "group"] = "zero_price"
 
 # ---------- 7. Checks ----------
-print("event days:", len(event_dates))
-print("still unclassified:")
+STANDARD = ["plate", "pot", "white", "red", "orange/rose", "pet nat/cremant",
+            "식료품 냉장", "식료품 냉동", "식료품 드라이", "🍞 New menu", "🍷New pot"]
+print("1) event days:", len(event_dates))
+print("2) categories not yet handled:",
+      sorted(set(all_data["category"]) - set(STANDARD) - set(EVENT_CATEGORIES) - set(CLASSIFY_CATS)))
+print("3) still unclassified:")
 print(all_data[all_data["group"] == "unclassified"]
       .groupby("key")[["qty", "net_revenue"]].sum()
-      .sort_values("net_revenue", ascending=False).head(15))
+      .sort_values("net_revenue", ascending=False).head(10))
 
-# ---------- 8. Ingredient log vs. food, by quarter (normal open days) ----------
-normal = all_data[~all_data["is_event_day"] & all_data["is_open_day"]]
-cov = normal.pivot_table(index="source_file", columns="group", values="qty", aggfunc="sum")
-cov["days_open"] = normal.groupby("source_file")["date"].nunique()
-cov["days_with_log"] = (normal[normal["group"] == "ingredient"]
-                        .groupby("source_file")["date"].nunique())
-cov["food_per_day"] = cov["food"] / cov["days_open"]
-cov["log_per_day"] = cov["ingredient"] / cov["days_open"]
-cov["log_per_food"] = cov["ingredient"] / cov["food"]
-print(cov.round(2).to_string())
-
-# ---------- 9. Before/after Oct 2024 (normal open days) ----------
-win = normal[(normal["date"] >= "2023-07-01") & (normal["date"] <= "2025-12-31")].copy()
-win["after"] = win["date"] >= "2024-10-01"
-open_days = win.groupby("after")["date"].nunique()
-
-def per_day(group):
-    t = win[win["group"] == group].groupby(["after", "key"])["qty"].sum().unstack("after").fillna(0)
-    t = t / open_days
-    t["change"] = t[True] - t[False]
-    return t.sort_values("change")
-
-print(per_day("ingredient").head(10))
-print(per_day("food").tail(10))
-
-
-#--------------Demand Patterns------------
-food = normal[normal["group"] == "food"]
-daily = food.groupby("date")["qty"].sum().reset_index()
-daily["weekday"] = daily["date"].dt.day_name()
-daily["month"] = daily["date"].dt.month
-
-print(daily.groupby("weekday")["qty"].agg(["mean", "count"]).round(1))
-print(daily.groupby("month")["qty"].agg(["mean", "count"]).round(1))
-
-order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-daily["weekday"] = pd.Categorical(daily["weekday"], categories=order, ordered=True)
-daily["year"] = daily["date"].dt.year
-print(daily.pivot_table(index="weekday", columns="year", values="qty", aggfunc=["mean", "count"], observed=False).round(1))
-
-##----baseline forecast----
-# daily = daily.sort_values("date").reset_index(drop=True)
-# g = daily.groupby("weekday", observed=True)["qty"]
-# daily["pred_last"] = g.shift(1)
-# daily["pred_avg4"] = g.transform(lambda s: s.shift(1).rolling(4, min_periods=2).mean())
-
-# test = daily[daily["date"] >= "2024-01-01"].dropna(subset=["pred_last", "pred_avg4"])
-
-# def wape(actual, pred):
-#     return (actual - pred).abs().sum() / actual.sum()
-
-# def bias(actual, pred):
-#     return (pred - actual).sum() / actual.sum()
-
-# for name in ["pred_last", "pred_avg4"]:
-#     print(name, "WAPE:", round(wape(test["qty"], test[name]), 3),
-#           "bias:", round(bias(test["qty"], test[name]), 3))
-
-daily = daily.sort_values("date").reset_index(drop=True)
-g = daily.groupby("weekday", observed=True)["qty"]
-daily["pred_last"] = g.shift(1)
-for k in [4, 8, 12]:
-    daily[f"pred_avg{k}"] = g.transform(lambda s, k=k: s.shift(1).rolling(k, min_periods=2).mean())
-
-preds = ["pred_last", "pred_avg4", "pred_avg8", "pred_avg12"]
-test = daily[daily["date"] >= "2024-01-01"].dropna(subset=preds).copy()
-test["week"] = test["date"].dt.to_period("W")
-weekly = test.groupby("week")[["qty"] + preds].sum()
-
+# ---------- 8. Baseline: Thu-Sun food items on normal open days (old location) ----------
 def wape(actual, pred):
     return (actual - pred).abs().sum() / actual.sum()
 
-for name in preds:
+normal = all_data[~all_data["is_event_day"] & all_data["is_open_day"]]
+food = normal[(normal["group"] == "food") & (normal["date"] < "2026-01-01")]
+daily = food.groupby("date")["qty"].sum().reset_index()
+daily["weekday"] = daily["date"].dt.day_name()
+
+core = daily[daily["weekday"].isin(THU_SUN)].sort_values("date").reset_index(drop=True)
+g = core.groupby("weekday")["qty"]
+core["pred_last"] = g.shift(1)
+core["pred_avg4"] = g.transform(lambda s: s.shift(1).rolling(4, min_periods=2).mean())
+
+test = core[core["date"] >= "2024-01-01"].dropna(subset=["pred_last", "pred_avg4"]).copy()
+test["week"] = test["date"].dt.to_period("W")
+n_days = test.groupby("week")["qty"].size()
+weekly = test.groupby("week")[["qty", "pred_last", "pred_avg4"]].sum()
+weekly = weekly[n_days == 4]
+
+print("4) Thu-Sun baselines")
+for name in ["pred_last", "pred_avg4"]:
     print(name, "daily WAPE:", round(wape(test["qty"], test[name]), 3),
           "| weekly WAPE:", round(wape(weekly["qty"], weekly[name]), 3))
+print("5) days scored:", len(test), "| complete weeks scored:", len(weekly))
 
-test["abs_err"] = (test["qty"] - test["pred_avg4"]).abs()
+# ---------- 9. Model: Poisson regression with calendar features, weekly rolling backtest ----------
+import numpy as np
+import holidays
+from sklearn.linear_model import PoissonRegressor
 
-by_day = test.groupby("weekday", observed=True)[["abs_err", "qty"]].sum()
-by_day["wape"] = by_day["abs_err"] / by_day["qty"]
-print(by_day.round(3))
+def bias(actual, pred):
+    return (pred - actual).sum() / actual.sum()
 
-big = test.nlargest(15, "abs_err").copy()
-big["err"] = big["qty"] - big["pred_avg4"]
-print(big[["date", "weekday", "qty", "pred_avg4", "err"]]) 
+kr = holidays.KR(years=range(2023, 2027))
+frame = core.dropna(subset=["pred_avg4"]).copy().reset_index(drop=True)
+frame["is_holiday"] = frame["date"].dt.date.map(lambda d: d in kr).astype(float)
+frame["pre_holiday"] = frame["date"].map(lambda d: (d + pd.Timedelta(days=1)).date() in kr).astype(float)
+frame["log_avg4"] = np.log1p(frame["pred_avg4"])
+frame["week_start"] = frame["date"].dt.to_period("W").dt.start_time
 
-dates = big["date"]
-sub = all_data[all_data["date"].isin(dates)]
+wd_cols = []
+for d in THU_SUN:
+    frame["wd_" + d] = (frame["weekday"] == d).astype(float)
+    wd_cols.append("wd_" + d)
+mo_cols = []
+for mth in range(1, 13):
+    frame["mo_%d" % mth] = (frame["date"].dt.month == mth).astype(float)
+    mo_cols.append("mo_%d" % mth)
+hol_cols = ["is_holiday", "pre_holiday"]
+lag_cols = ["log_avg4"]
 
-chk = sub.pivot_table(index="date", columns="group", values="qty", aggfunc="sum", fill_value=0)
-chk["revenue"] = sub.groupby("date")["net_revenue"].sum()
+weeks = sorted(frame.loc[frame["date"] >= "2024-01-01", "week_start"].unique())
 
-STANDARD = ["plate", "pot", "white", "red", "orange/rose", "pet nat/cremant",
-            "식료품 냉장", "식료품 냉동", "식료품 드라이"]
-chk["other_categories"] = (sub[~sub["category"].isin(STANDARD)]
-                           .groupby("date")["category"].agg(lambda s: ", ".join(sorted(set(s)))))
-print(chk.to_string())
+def backtest(cols, alpha=1.0, window_weeks=None):
+    out = []
+    for ws in weeks:
+        train = frame[frame["date"] < ws]
+        if window_weeks:
+            train = train[train["date"] >= ws - pd.Timedelta(weeks=window_weeks)]
+        tw = frame[frame["week_start"] == ws]
+        if len(tw) == 0 or len(train) < 60:
+            continue
+        m = PoissonRegressor(alpha=alpha, max_iter=3000).fit(train[cols], train["qty"])
+        out.append(pd.Series(m.predict(tw[cols]), index=tw.index))
+    return pd.concat(out)
+
+def score(pred):
+    ev = frame.loc[pred.index, ["qty", "week_start"]].copy()
+    ev["pred"] = pred
+    wk = ev.groupby("week_start").agg(qty=("qty", "sum"), pred=("pred", "sum"), n=("qty", "size"))
+    wk = wk[wk["n"] == 4]
+    return (round(wape(ev["qty"], ev["pred"]), 3), round(wape(wk["qty"], wk["pred"]), 3),
+            round(bias(ev["qty"], ev["pred"]), 3))
+
+feature_sets = {
+    "weekday only": wd_cols,
+    "weekday + avg4": wd_cols + lag_cols,
+    "weekday + month": wd_cols + mo_cols,
+    "weekday + month + holiday": wd_cols + mo_cols + hol_cols,
+    "weekday + month + holiday + avg4": wd_cols + mo_cols + hol_cols + lag_cols,
+}
+
+results, preds = [], {}
+for name, cols in feature_sets.items():
+    preds[name] = backtest(cols)
+idx = preds["weekday only"].index
+results.append(("baseline: avg of last 4 same weekdays",) + score(frame.loc[idx, "pred_avg4"]))
+for name in feature_sets:
+    results.append((name,) + score(preds[name]))
+
+print("6) Model comparison (same days for every row)")
+print(pd.DataFrame(results, columns=["model", "daily WAPE", "weekly WAPE", "bias"]).to_string(index=False))
+print("days scored:", len(idx))
+
+print("7) Training-window test")
+best_sets = ["weekday + avg4", "weekday + month + holiday + avg4"]
+runs = {}
+for name in best_sets:
+    for w in [None, 52, 26]:
+        runs[(name, w)] = backtest(feature_sets[name], window_weeks=w)
+common = idx
+for p in runs.values():
+    common = common.intersection(p.index)
+rows = [("baseline",) + score(frame.loc[common, "pred_avg4"])]
+for (name, w), p in runs.items():
+    rows.append((name + " | train on " + str(w or "all") + " weeks",) + score(p.loc[common]))
+print(pd.DataFrame(rows, columns=["model", "daily WAPE", "weekly WAPE", "bias"]).to_string(index=False))
+print("days scored:", len(common))
+
+# ---------- 10. Weekly order suggestion (v1, dish level, seasonal baseline) ----------
+SERVICE_LEVEL = 0.80   # chance of NOT running out; see newsvendor note
+NEW_LOCATION_START = "2026-09-01"
+PLANNED_DAYS = pd.to_datetime(["2026-10-29", "2026-10-30", "2026-10-31", "2026-11-01"])  # change weekly
+
+old_daily = daily[daily["date"] < "2026-01-01"].copy()
+old_daily["doy"] = old_daily["date"].dt.dayofyear
+
+def seasonal_pred(date, history=None, window=21):
+    h = old_daily if history is None else history
+    h = h[h["weekday"] == date.day_name()]
+    diff = (h["doy"] - date.dayofyear).abs()
+    diff = np.minimum(diff, 365 - diff)
+    s = h.loc[diff <= window, "qty"]
+    return s.mean() if len(s) >= 3 else h["qty"].mean()
+
+# Check: predict 2025 using only 2023-24 history, vs. the 4-week average, same days
+hist = old_daily[old_daily["date"] < "2025-01-01"]
+chk = old_daily[(old_daily["date"] >= "2025-01-01") & old_daily["weekday"].isin(THU_SUN)].copy()
+chk["seasonal"] = chk["date"].map(lambda d: seasonal_pred(d, history=hist))
+chk = chk.merge(core[["date", "pred_avg4"]], on="date", how="left").dropna(subset=["seasonal", "pred_avg4"])
+chk["week"] = chk["date"].dt.to_period("W")
+wk = chk.groupby("week").agg(qty=("qty", "sum"), seasonal=("seasonal", "sum"),
+                             avg4=("pred_avg4", "sum"), n=("qty", "size"))
+wk = wk[wk["n"] == 4]
+print("7) 2025 check, seasonal (trained on 2023-24 only) vs avg4 | daily:",
+      round(wape(chk["qty"], chk["seasonal"]), 3), "vs", round(wape(chk["qty"], chk["pred_avg4"]), 3),
+      "| weekly:", round(wape(wk["qty"], wk["seasonal"]), 3), "vs", round(wape(wk["qty"], wk["avg4"]), 3),
+      "| weeks:", len(wk))
+
+# Level adjustment for the new location
+new_food = normal[(normal["group"] == "food") & (normal["date"] >= NEW_LOCATION_START)]
+new_daily = new_food.groupby("date")["qty"].sum().reset_index()
+new_daily["weekday"] = new_daily["date"].dt.day_name()
+new_daily = new_daily[new_daily["weekday"].isin(THU_SUN)]
+if len(new_daily) >= 3:
+    level_adjust = new_daily["qty"].sum() / new_daily["date"].map(seasonal_pred).sum()
+else:
+    level_adjust = 1.0
+print("8) new-location Thu-Sun days used:", len(new_daily), "| level adjustment:", round(level_adjust, 2))
+nd = new_daily.copy()
+nd["seasonal"] = nd["date"].map(seasonal_pred)
+nd["week"] = nd["date"].dt.to_period("W")
+trend = nd.groupby("week").agg(actual=("qty", "sum"), seasonal=("seasonal", "sum"), days=("qty", "size"))
+trend["ratio"] = (trend["actual"] / trend["seasonal"]).round(2)
+print("   weekly level ratio at new location:")
+print(trend.to_string())
+
+# Forecast and buffer
+expected_total = sum(seasonal_pred(d) for d in PLANNED_DAYS) * level_adjust
+ratio = wk["qty"] / wk["seasonal"]
+print("   weekly actual/seasonal ratio quantiles:", ratio.quantile([0.1, 0.5, 0.8, 0.9]).round(2).to_dict(),
+      "| weeks:", len(ratio))
+mult = ratio.quantile(SERVICE_LEVEL)
+order_up_to = expected_total * mult
+print("   expected food items:", round(expected_total), "| order up to:", round(order_up_to),
+      "| buffer multiplier:", round(mult, 2))
+
+# Dish shares: new menu if there is enough new-location data, else the same season in earlier years
+food_all = normal[(normal["group"] == "food") & normal["date"].dt.day_name().isin(THU_SUN)]
+new_part = food_all[food_all["date"] >= NEW_LOCATION_START]
+if new_part["date"].nunique() >= 3:
+    src, label = new_part, "new location"
+else:
+    dd = (food_all["date"].dt.dayofyear - PLANNED_DAYS[0].dayofyear).abs()
+    dd = np.minimum(dd, 365 - dd)
+    src, label = food_all[(dd <= 28) & (food_all["date"] < "2026-01-01")], "same season, earlier years"
+share = src.groupby("key")["qty"].sum()
+share = (share / share.sum()).sort_values(ascending=False)
+share = share[share.cumsum() - share < 0.95]
+order = pd.DataFrame({"share": share.round(3),
+                      "expected": (expected_total * share).round(1),
+                      "order_up_to": np.ceil(order_up_to * share).astype(int)})
+print("9) dish quantities from:", label)
+print(order.head(15).to_string())

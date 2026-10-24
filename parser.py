@@ -1,20 +1,10 @@
 import pandas as pd
 
 GROUP_MAP = {
-    # old location
-    "plate": "food",
-    "pot": "wine",
-    "white": "wine",
-    "red": "wine",
-    "orange/rose": "wine",
-    "pet nat/cremant": "wine",
-    # new location
-    "🍞 New menu": "food",
-    "🍷New pot": "wine",
-    "식료품 냉장": "ingredient",
-    "식료품 냉동": "ingredient",
-    "식료품 드라이": "ingredient",
-    "미분류": "other",
+    "plate": "food", "🍞 New menu": "food",
+    "pot": "wine", "white": "wine", "red": "wine", "orange/rose": "wine",
+    "pet nat/cremant": "wine", "🍷New pot": "wine",
+    "식료품 냉장": "ingredient", "식료품 냉동": "ingredient", "식료품 드라이": "ingredient",
 }
 
 def load_payhere(path):
@@ -29,9 +19,10 @@ def load_payhere(path):
         "카테고리명": "category", "상품명": "product", "상품별 단가": "unit_price",
         "수량": "qty", "실매출": "net_revenue",
     })
-    products["category"] = products["category"].str.split().str.join(" ")
     products["date"] = pd.to_datetime(products["영업일"])
-    products = products[["date", "category", "product", "unit_price", "qty", "net_revenue"]]
+    products["category"] = products["category"].str.split().str.join(" ")
+    products["group"] = products["category"].map(GROUP_MAP).fillna("other")
+    products = products[["date", "category", "product", "unit_price", "qty", "net_revenue", "group"]]
 
     # Proof: our per-day revenue must match the file's own daily totals
     reported = raw[is_daily_total].copy()
@@ -41,11 +32,4 @@ def load_payhere(path):
     diff = reported.sub(computed, fill_value=0).abs()
     assert diff.max() == 0, f"Daily totals don't match on: {diff[diff > 0].index.tolist()}"
 
-    products["group"] = products["category"].map(GROUP_MAP).fillna("other")
-    unmapped = set(products["category"]) - set(GROUP_MAP)
-    if unmapped:
-        print("Warning: categories not in GROUP_MAP:", unmapped)
-
-    products = products.reset_index(drop=True)
-
-    return products
+    return products.reset_index(drop=True)

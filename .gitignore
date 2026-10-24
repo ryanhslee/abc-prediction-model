@@ -1,3 +1,4 @@
 #ignore sensitive data folder
 data/
 data hidden/
+.streamlit/secrets.toml
